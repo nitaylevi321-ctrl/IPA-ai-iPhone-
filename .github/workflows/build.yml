@@ -5,6 +5,9 @@ on:
   push:
     branches: [main, master]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -148,9 +151,19 @@ jobs:
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/LocalAI.app Payload/
           zip -qry LocalAI.ipa Payload
+          ls -la LocalAI.ipa
+          unzip -l LocalAI.ipa | grep -E "index.html|Info.plist|LocalAI$" || true
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: LocalAI-ipa
           path: LocalAI.ipa
+          if-no-files-found: error
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Local AI build ${{ github.run_number }}
+          files: LocalAI.ipa
