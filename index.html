@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<title>Local AI</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--line:#262b36;--text:#e8eaf0;--muted:#8b93a7;--accent:#ff7a45;--user:#2a2f3c}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:16px/1.45 -apple-system,system-ui,sans-serif}
+body{display:flex;flex-direction:column;height:100dvh;padding-top:env(safe-area-inset-top)}
+header{display:flex;gap:8px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:17px;margin:0;flex:0 0 auto}
+select,button,textarea{font:inherit;color:inherit}
+select{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:8px}
+button{background:var(--accent);color:#1a0d05;border:0;border-radius:10px;padding:8px 12px;font-weight:600}
+button.ghost{background:var(--user);color:var(--text)}
+button:disabled{opacity:.45}
+#progress{height:3px;background:var(--line)}
+#bar{height:100%;width:0;background:var(--accent);transition:width .2s}
+#status{padding:6px 12px;font-size:13px;color:var(--muted);min-height:28px}
+#msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:12px;-webkit-overflow-scrolling:touch}
+.msg{max-width:92%;padding:10px 12px;border-radius:14px;overflow-wrap:anywhere}
+.msg.user{align-self:flex-end;background:var(--user);white-space:pre-wrap}
+.msg.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--line)}
+.msg p{margin:0 0 8px}.msg p:last-child{margin:0}
+code{background:#0b0d11;padding:1px 5px;border-radius:5px;font-size:.9em}
+.code{margin:8px 0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#0b0d11}
+.code .top{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#12151b;font-size:13px}
+.code .top span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}
+.code .top button{padding:5px 9px;font-size:13px}
+.code pre{margin:0;padding:10px;overflow:auto;font-size:13px;line-height:1.4;max-height:50vh}
+.code pre code{background:none;padding:0}
+.zipbtn{margin-top:8px}
+#welcome{margin:auto 0;text-align:center;color:var(--muted)}
+#welcome h2{color:var(--text);margin:0 0 6px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:12px}
+.chips button{background:var(--panel);color:var(--text);border:1px solid var(--line);font-weight:500;font-size:14px}
+#composer{display:flex;gap:8px;align-items:flex-end;padding:10px 12px calc(10px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:var(--panel)}
+textarea{flex:1;resize:none;max-height:140px;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px}
+#modal{position:fixed;inset:0;background:var(--bg);display:none;flex-direction:column;padding-top:env(safe-area-inset-top)}
+#modal.on{display:flex}
+#modal .mt{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:var(--panel)}
+#modal iframe{flex:1;border:0;background:#fff}
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 Local AI</h1>
+  <select id="model"></select>
+  <button id="load">Load</button>
+  <button id="clear" class="ghost" title="New chat">＋</button>
+</header>
+<div id="progress"><div id="bar"></div></div>
+<div id="status">Starting…</div>
+<div id="msgs"></div>
+<div id="composer">
+  <textarea id="input" rows="1" placeholder="Load a model first…" disabled></textarea>
+  <button id="send" disabled>Send</button>
+</div>
+<div id="modal">
+  <div class="mt"><b>Preview</b><button id="closeModal" class="ghost">Close</button></div>
+  <iframe id="frame" sandbox="allow-scripts allow-forms allow-modals"></iframe>
+</div>
+
+<script type="module">
+const $ = s => document.querySelector(s);
+const msgsEl = $("#msgs"), input = $("#input"), sendBtn = $("#send"), loadBtn = $("#load");
+const modelSel = $("#model"), statusEl = $("#status"), bar = $("#bar");
+let webllm = null, engine = null, busy = false, history = [];
+
+const SYSTEM = [
+  "You are Local AI: a smart, friendly, funny assistant running 100% on the user's device. Be accurate, clear and not too wordy.",
+  "If the user wants a file (html, code, text, json, csv, etc.), write the COMPLETE file inside a fenced code block, and put the file name on its own line right before the block, exactly like:",
+  "File: index.html",
+  "```html",
+  "...full content...",
+  "```",
+  "Several files = several blocks, each with its own File: line. Never use placeholders like 'rest of code here'.",
+  "You cannot create real .ipa or .apk files. If asked, explain how to build them instead."
+].join("\n");
+
+const PREFERRED = [
+  ["Qwen2.5-0.5B-Instruct-q4f16_1-MLC", "Tiny • fastest (~0.5GB)"],
+  ["Llama-3.2-1B-Instruct-q4f16_1-MLC", "Small • balanced (~0.9GB)"],
+  ["Qwen2.5-1.5B-Instruct-q4f16_1-MLC", "Medium • smarter (~1.6GB)"],
+  ["Qwen2.5-Coder-1.5B-Instruct-q4f16_1-MLC", "Coder • best for code/files (~1.6GB)"],
+  ["Llama-3.2-3B-Instruct-q4f16_1-MLC", "Large • smartest (~2.3GB, strong phones only)"]
+];
+
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+};
+const setStatus = t => { statusEl.textContent = t; };
+
+// ---------- text rendering ----------
+const esc = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const EXT = { javascript: "js", js: "js", typescript: "ts", ts: "ts", python: "py", py: "py", html: "html", css: "css", json: "json", csv: "csv", bash: "sh", sh: "sh", shell: "sh", markdown: "md", md: "md", xml: "xml", yaml: "yml", yml: "yml", swift: "swift", java: "java", kotlin: "kt", c: "c", cpp: "cpp", "c++": "cpp", csharp: "cs", cs: "cs", go: "go", rust: "rs", php: "php", ruby: "rb", sql: "sql", text: "txt", txt: "txt", "": "txt" };
+const extFor = l => EXT[l] || l.replace(/[^a-z0-9]/g, "") || "txt";
+
+function addText(el, t) {
+  t = t.trim();
+  if (!t) return;
+  for (const para of t.split(/\n{2,}/)) {
+    const p = document.createElement("p");
+    p.innerHTML = esc(para)
+      .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/\n/g, "<br>");
+    el.appendChild(p);
+  }
+}
+
+function addCode(el, name, lang, code, final) {
+  const box = document.createElement("div"); box.className = "code";
+  const top = document.createElement("div"); top.className = "top";
+  const label = document.createElement("span"); label.textContent = name; top.appendChild(label);
+  const pre = document.createElement("pre"), c = document.createElement("code");
+  c.textContent = code; pre.appendChild(c);
+  if (final) {
+    const mk = (txt, fn) => { const b = document.createElement("button"); b.className = "ghost"; b.textContent = txt; b.onclick = fn; top.appendChild(b); };
+    if (lang === "html" || /\.html?$/i.test(name)) mk("▶ Run", () => preview(code));
+    mk("Copy", async e => { try { await navigator.clipboard.writeText(code); e.target.textContent = "Copied"; setTimeout(() => e.target.textContent = "Copy", 1200); } catch {} });
+    mk("⬇ Save", () => saveBlob(name, new Blob([code], { type: "text/plain" })));
+  }
+  box.append(top, pre); el.appendChild(box);
+}
+
+function renderInto(el, text, final) {
+  el.textContent = "";
+  const re = /```([\w+#.-]*)[ \t]*\n([\s\S]*?)(?:```|$)/g;
+  const files = [];
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    let before = text.slice(last, m.index), name = null;
+    const fm = before.match(/(?:^|\n)[ \t]*\**file(?:name)?\**[ \t]*:?\**[ \t]*`?([\w.\-\/]+)`?\**[ \t]*\n?$/i);
+    if (fm) { name = fm[1]; before = before.slice(0, fm.index); }
+    addText(el, before);
+    const lang = (m[1] || "").toLowerCase();
+    const code = m[2].replace(/\n$/, "");
+    const fname = name || ("file." + extFor(lang));
+    addCode(el, fname, lang, code, final);
+    files.push({ name: fname, data: code });
+    last = re.lastIndex;
+  }
+  addText(el, text.slice(last));
+  if (final && files.length > 1) {
+    const b = document.createElement("button"); b.className = "zipbtn";
+    b.textContent = "⬇ Download all (" + files.length + ") as ZIP";
+    b.onclick = () => zipAll(files);
+    el.appendChild(b);
+  }
+}
+
+function addMsg(role, text) {
+  const el = document.createElement("div"); el.className = "msg " + role;
+  if (role === "user") el.textContent = text; else renderInto(el, text, true);
+  msgsEl.appendChild(el);
+  return el;
+}
+const nearBottom = () => msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 140;
+const toBottom = () => { msgsEl.scrollTop = msgsEl.scrollHeight; };
+
+// ---------- files ----------
+// ZIP-START
+const crcTable = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = crcTable[(c ^ u8[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function makeZip(files) {
+  const enc = new TextEncoder(), parts = [], central = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(8, 0, true);
+    lh.setUint16(10, 0, true); lh.setUint16(12, 0x21, true);
+    lh.setUint32(14, crc, true); lh.setUint32(18, size, true); lh.setUint32(22, size, true);
+    lh.setUint16(26, name.length, true); lh.setUint16(28, 0, true);
+    parts.push(new Uint8Array(lh.buffer), name, f.data);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true);
+    ch.setUint16(12, 0, true); ch.setUint16(14, 0x21, true);
+    ch.setUint32(16, crc, true); ch.setUint32(20, size, true); ch.setUint32(24, size, true);
+    ch.setUint16(28, name.length, true); ch.setUint16(30, 0, true); ch.setUint16(32, 0, true); ch.setUint16(34, 0, true); ch.setUint16(36, 0, true);
+    ch.setUint32(38, 0, true); ch.setUint32(42, offset, true);
+    central.push(new Uint8Array(ch.buffer), name);
+    offset += 30 + name.length + size;
+  }
+  let csize = 0; for (const p of central) csize += p.length;
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, csize, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, new Uint8Array(end.buffer)], { type: "application/zip" });
+}
+// ZIP-END
+
+function zipAll(files) {
+  const enc = new TextEncoder(), seen = new Map();
+  const list = files.map(f => {
+    let n = f.name;
+    if (seen.has(n)) { const k = seen.get(n) + 1; seen.set(n, k); n = n.replace(/(\.[^.]*)?$/, "-" + k + "$1"); } else seen.set(n, 1);
+    return { name: n, data: enc.encode(f.data) };
+  });
+  saveBlob("files.zip", makeZip(list));
+}
+
+function saveBlob(name, blob) {
+  const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.saveFile;
+  if (h) { // inside the iOS app: open the share sheet (Save to Files, AirDrop, ...)
+    const r = new FileReader();
+    r.onload = () => h.postMessage({ name, data: String(r.result).split(",")[1] });
+    r.readAsDataURL(blob);
+    return;
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name.split("/").pop();
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+function preview(code) { $("#frame").srcdoc = code; $("#modal").classList.add("on"); }
+$("#closeModal").onclick = () => { $("#modal").classList.remove("on"); $("#frame").srcdoc = ""; };
+
+// ---------- chat ----------
+function recent() {
+  const out = []; let n = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    n += history[i].content.length;
+    if (n > 7000 && out.length) break;
+    out.unshift(history[i]);
+  }
+  return out;
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text || busy || !engine) return;
+  input.value = ""; input.style.height = "auto";
+  const w = $("#welcome"); if (w) w.remove();
+  history.push({ role: "user", content: text });
+  addMsg("user", text);
+  const el = addMsg("assistant", ""); el.textContent = "…";
+  toBottom();
+  busy = true; sendBtn.textContent = "Stop";
+  let out = "", err = "", lastR = 0;
+  try {
+    const stream = await engine.chat.completions.create({
+      messages: [{ role: "system", content: SYSTEM }, ...recent()],
+      stream: true, temperature: 0.7, max_tokens: 2048
+    });
+    for await (const chunk of stream) {
+      out += (chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content) || "";
+      if (Date.now() - lastR > 80) {
+        const near = nearBottom();
+        renderInto(el, out, false);
+        if (near) toBottom();
+        lastR = Date.now();
+      }
+    }
+  } catch (e) { err = "⚠️ " + (e.message || e); }
+  busy = false; sendBtn.textContent = "Send";
+  if (out) history.push({ role: "assistant", content: out }); else history.pop();
+  renderInto(el, (out || "") + (err ? (out ? "\n\n" : "") + err : (out ? "" : "(no reply)")), true);
+  toBottom();
+  store.set("chat", history);
+}
+
+sendBtn.onclick = () => { if (busy) { try { engine.interruptGenerate(); } catch {} } else send(); };
+input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 140) + "px"; });
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey && !/iPhone|iPad|Android/i.test(navigator.userAgent)) { e.preventDefault(); send(); }
+});
+
+function showWelcome() {
+  const d = document.createElement("div"); d.id = "welcome";
+  d.innerHTML = "<h2>Local AI</h2><div>Runs fully on your device. It can write code and make files you can download.</div><div class='chips'></div>";
+  const chips = d.querySelector(".chips");
+  for (const t of ["Make a snake game in one HTML file", "Make a ZIP with a simple website", "Write a Python script that renames files", "Tell me a joke about my phone"]) {
+    const b = document.createElement("button"); b.textContent = t;
+    b.onclick = () => { input.value = t; input.dispatchEvent(new Event("input")); if (engine) send(); else input.focus(); };
+    chips.appendChild(b);
+  }
+  msgsEl.appendChild(d);
+}
+
+function resetChat() {
+  if (busy) { try { engine.interruptGenerate(); } catch {} }
+  history = []; msgsEl.innerHTML = ""; store.set("chat", []); showWelcome();
+}
+$("#clear").onclick = resetChat;
+
+// ---------- model loading ----------
+loadBtn.onclick = async () => {
+  if (!webllm) return;
+  loadBtn.disabled = modelSel.disabled = true;
+  bar.style.width = "0%";
+  try {
+    if (engine) { try { await engine.unload(); } catch {} engine = null; }
+    engine = await webllm.CreateMLCEngine(modelSel.value, {
+      initProgressCallback: p => { bar.style.width = Math.round((p.progress || 0) * 100) + "%"; setStatus(p.text); }
+    });
+    store.set("model", modelSel.value);
+    setStatus("✅ Ready. Running fully on your device.");
+    input.disabled = false; sendBtn.disabled = false; input.placeholder = "Message Local AI…";
+  } catch (e) {
+    engine = null;
+    setStatus("⚠️ Load failed: " + (e.message || e) + " — try a smaller model.");
+  }
+  loadBtn.disabled = modelSel.disabled = false;
+};
+
+(async function init() {
+  history = store.get("chat", []);
+  if (history.length) for (const m of history) addMsg(m.role, m.content); else showWelcome();
+  toBottom();
+  if (!navigator.gpu) { setStatus("⚠️ WebGPU isn't available here, so the AI can't run. On iPhone you need iOS 26 or newer."); loadBtn.disabled = true; return; }
+  try { webllm = await import("https://esm.run/@mlc-ai/web-llm"); }
+  catch (e) { setStatus("⚠️ Couldn't load the AI engine. Connect to the internet (needed for the first download)."); loadBtn.disabled = true; return; }
+  const have = new Set(webllm.prebuiltAppConfig.model_list.map(m => m.model_id));
+  let opts = PREFERRED.filter(([id]) => have.has(id));
+  if (!opts.length) opts = webllm.prebuiltAppConfig.model_list.slice(0, 10).map(m => [m.model_id, m.model_id]);
+  modelSel.innerHTML = "";
+  for (const [id, label] of opts) { const o = document.createElement("option"); o.value = id; o.textContent = label; modelSel.appendChild(o); }
+  const saved = store.get("model", null);
+  if (saved && have.has(saved)) modelSel.value = saved;
+  setStatus("Pick a model and tap Load. First time it downloads, after that it's cached.");
+})();
+</script>
+</body>
+</html>
