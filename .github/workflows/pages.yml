@@ -1,0 +1,45 @@
+name: Enable Pages
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/pages.yml"
+
+permissions:
+  contents: write
+  pages: write
+
+jobs:
+  enable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Turn on GitHub Pages (main, root)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          gh api -X POST "repos/${{ github.repository }}/pages" \
+            -f "source[branch]=main" -f "source[path]=/" > pages-api.txt 2>&1
+          echo "exit=$?" >> pages-api.txt
+          cat pages-api.txt
+
+      - name: Check the site
+        run: |
+          sleep 90
+          OWNER=$(echo "${{ github.repository_owner }}" | tr 'A-Z' 'a-z')
+          URL="https://${OWNER}.github.io/${{ github.event.repository.name }}/"
+          echo "$URL" > pages-check.txt
+          curl -s -o /dev/null -w "http=%{http_code}\n" "$URL" >> pages-check.txt
+          cat pages-check.txt
+
+      - name: Save the result to a branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git checkout -b pages-status
+          git add -f pages-api.txt pages-check.txt
+          git commit -m "Pages status"
+          git push -f origin pages-status
